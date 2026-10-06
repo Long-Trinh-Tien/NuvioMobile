@@ -293,6 +293,22 @@ final class MPVPlayerViewController: UIViewController {
     }
     private var _currentErrorMessage: String?
 
+    // Discontinuity rescue: if mpv's time-pos suddenly drops to ~0 mid-playback
+    // (sloppy ad-spliced HLS), seek back to the last good position.
+    private var lastGoodPositionMs: Int64 = 0
+    private var previousPollPositionMs: Int64 = 0
+    private var previousPollWasPlaying: Bool = false
+    private var discontinuityRescuesUsed: Int = 0
+    private var discontinuityRescueCooldownUntil: TimeInterval = 0
+
+    private func resetDiscontinuityGuard() {
+        lastGoodPositionMs = 0
+        previousPollPositionMs = 0
+        previousPollWasPlaying = false
+        discontinuityRescuesUsed = 0
+        discontinuityRescueCooldownUntil = 0
+    }
+
     override var canBecomeFirstResponder: Bool {
         true
     }
@@ -611,7 +627,18 @@ final class MPVPlayerViewController: UIViewController {
         isPlayerLoading = true
         isPlayerEnded = false
         applyAudioLanguagePreferences(preferredAudioLanguages)
-        command("loadfile", args: [request.urlString, "replace"])
+        resetDiscontinuityGuard()
+        // Sanitize sloppy ad-spliced HLS playlists (e.g. KKPhim/phimapi) so mpv
+        // keeps playing across discontinuities instead of resetting to 0.
+        // Falls back to the original URL on any failure.
+        HLSPlaylistSanitizer.shared.sanitizedURL(
+            for: request.urlString,
+            headers: sanitizedHeaders
+        ) { [weak self] finalURL in
+            guard let self else { return }
+            guard self.mpv != nil else { return }
+            self.command("loadfile", args: [finalURL, "replace"])
+        }
         if let audioUrl = request.audioUrl, !audioUrl.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
                 self?.command("audio-add", args: [audioUrl, "select"], checkForErrors: false)
@@ -940,6 +967,45 @@ final class MPVPlayerViewController: UIViewController {
         let shouldPublishNowPlayingState = !isPlayerLoading || isPlayerPlaying || durationMs > 0 || positionMs > 0
         if shouldPublishNowPlayingState {
             syncNowPlayingPlaybackState(isPlaying: isPlayerPlaying)
+        }
+
+        guardDiscontinuityReset(seeking: seeking, eofReached: eofReached)
+    }
+
+    /// Safety net for ad-spliced HLS: mpv can reset time-pos to ~0 when it hits
+    /// a discontinuity instead of playing through. Detect the sudden drop and
+    /// seek back to the last good position (max 3 rescues per load).
+    private func guardDiscontinuityReset(seeking: Bool, eofReached: Bool) {
+        defer {
+            previousPollPositionMs = positionMs
+            previousPollWasPlaying = isPlayerPlaying
+        }
+
+        if positionMs > lastGoodPositionMs {
+            lastGoodPositionMs = positionMs
+        }
+
+        let now = ProcessInfo.processInfo.systemUptime
+        let suddenDrop = previousPollWasPlaying
+            && !seeking
+            && !eofReached
+            && previousPollPositionMs - positionMs > 20_000
+            && positionMs < 2_000
+            && lastGoodPositionMs > 30_000
+            && durationMs > 60_000
+            && discontinuityRescuesUsed < 3
+            && now >= discontinuityRescueCooldownUntil
+
+        guard suddenDrop else { return }
+
+        discontinuityRescuesUsed += 1
+        discontinuityRescueCooldownUntil = now + 5
+        let rescueMs = lastGoodPositionMs
+        print("[MPV] Discontinuity reset detected (\(previousPollPositionMs) -> \(positionMs)), rescuing to \(rescueMs) (attempt \(discontinuityRescuesUsed))")
+        if Thread.isMainThread {
+            seekToMs(rescueMs)
+        } else {
+            DispatchQueue.main.async { [weak self] in self?.seekToMs(rescueMs) }
         }
     }
 
@@ -1367,3 +1433,292 @@ enum NuvioPlayerRegistration {
         NuvioPlayerBridgeFactory.shared.registerFactory(creator: MPVPlayerBridgeCreator())
     }
 }
+
+// MARK: - HLS ad-discontinuity sanitizer (fix: reset-to-0 on ad segments)
+import Foundation
+
+/// Rewrites HLS (m3u8) playlists so mpv keeps playing across sloppy
+/// ad-injected discontinuities instead of resetting position to 0.
+///
+/// What it does (VOD only, anything else passes through untouched):
+///  1. Collapses consecutive duplicate `#EXT-X-DISCONTINUITY` tags into one.
+///     Back-to-back duplicates are meaningless per the HLS spec but trip up
+///     demuxers (observed on phimapi/KKPhim ad-spliced playlists).
+///  2. Absolutizes every relative URI (segments, KEY, MAP, variants) so the
+///     rewritten playlist can be played from a local temp file.
+///  3. Keeps everything else byte-identical (incl. ENDLIST / TARGETDURATION).
+///
+/// On any failure it falls back to the original URL (current behavior).
+final class HLSPlaylistSanitizer {
+
+    static let shared = HLSPlaylistSanitizer()
+
+    private let session: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 12
+        config.timeoutIntervalForResource = 12
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        return URLSession(configuration: config)
+    }()
+
+    private let workQueue = DispatchQueue(label: "hls-sanitizer", qos: .userInitiated)
+
+    /// Resolve `urlString` to a playable URL, calling completion on main thread.
+    func sanitizedURL(
+        for urlString: String,
+        headers: [String: String],
+        completion: @escaping (String) -> Void
+    ) {
+        guard
+            let url = URL(string: urlString),
+            let scheme = url.scheme?.lowercased(),
+            (scheme == "http" || scheme == "https"),
+            url.pathExtension.lowercased() == "m3u8"
+        else {
+            completion(urlString)
+            return
+        }
+
+        workQueue.async { [weak self] in
+            guard let self else {
+                DispatchQueue.main.async { completion(urlString) }
+                return
+            }
+            self.rewritePlaylist(at: url, headers: headers) { localURL in
+                DispatchQueue.main.async { completion(localURL ?? urlString) }
+            }
+        }
+    }
+
+    // MARK: - Core
+
+    private func rewritePlaylist(
+        at url: URL,
+        headers: [String: String],
+        completion: @escaping (String?) -> Void
+    ) {
+        fetchText(url: url, headers: headers) { [weak self] text in
+            guard let self, let text else { completion(nil); return }
+            guard text.contains("#EXTM3U") else { completion(nil); return }
+
+            if text.contains("#EXT-X-STREAM-INF") {
+                self.rewriteMaster(text, baseURL: url, headers: headers, completion: completion)
+            } else if text.contains("#EXT-X-ENDLIST") {
+                // VOD media playlist -> sanitize into a temp file.
+                if let fileURL = self.writeMediaPlaylist(
+                    self.sanitizeMediaPlaylist(text, baseURL: url),
+                    suffix: "media"
+                ) {
+                    completion(fileURL.path)
+                } else {
+                    completion(nil)
+                }
+            } else {
+                // Live / event playlist (no ENDLIST): do not touch.
+                completion(nil)
+            }
+        }
+    }
+
+    private func rewriteMaster(
+        _ text: String,
+        baseURL: URL,
+        headers: [String: String],
+        completion: @escaping (String?) -> Void
+    ) {
+        let lines = text.components(separatedBy: .newlines)
+        // Collect variant + rendition URIs that need local copies.
+        var targets: [(lineIndex: Int, uri: String, kind: String)] = []
+        var i = 0
+        while i < lines.count {
+            let line = lines[i].trimmingCharacters(in: .whitespaces)
+            if line.hasPrefix("#EXT-X-STREAM-INF") || line.hasPrefix("#EXT-X-I-FRAMES-ONLY") {
+                if i + 1 < lines.count {
+                    let uri = lines[i + 1].trimmingCharacters(in: .whitespaces)
+                    if !uri.isEmpty, !uri.hasPrefix("#") {
+                        targets.append((i + 1, uri, "variant"))
+                    }
+                }
+            } else if line.hasPrefix("#EXT-X-MEDIA:") {
+                if let uri = Self.attributeURI(line, key: "URI") {
+                    targets.append((i, uri, "media"))
+                }
+            }
+            i += 1
+        }
+        guard !targets.isEmpty else { completion(nil); return }
+
+        guard let dir = Self.makeTempDir() else { completion(nil); return }
+        let group = DispatchGroup()
+        var rewritten = lines
+        var failed = false
+        let lock = NSLock()
+
+        for (index, uri, kind) in targets {
+            guard let absolute = Self.absoluteURL(uri, base: baseURL) else { continue }
+            group.enter()
+            if kind == "variant" {
+                fetchText(url: absolute, headers: headers) { [weak self] mediaText in
+                    defer { group.leave() }
+                    guard let self, let mediaText, mediaText.contains("#EXTM3U") else {
+                        lock.lock(); failed = true; lock.unlock(); return
+                    }
+                    let body: String
+                    if mediaText.contains("#EXT-X-STREAM-INF") {
+                        body = mediaText // nested master: absolutize only
+                    } else if mediaText.contains("#EXT-X-ENDLIST") {
+                        body = self.sanitizeMediaPlaylist(mediaText, baseURL: absolute)
+                    } else {
+                        body = mediaText
+                    }
+                    let fileName = "v\(index).m3u8"
+                    let fileURL = dir.appendingPathComponent(fileName)
+                    do {
+                        try body.write(to: fileURL, atomically: true, encoding: .utf8)
+                        lock.lock(); rewritten[index] = fileURL.path; lock.unlock()
+                    } catch {
+                        lock.lock(); failed = true; lock.unlock()
+                    }
+                }
+            } else {
+                // Rendition (audio/subs) playlist: absolutize only, keep remote.
+                lock.lock(); rewritten[index] = Self.rewriteURIAttribute(lines[index], key: "URI", base: baseURL); lock.unlock()
+                group.leave()
+            }
+        }
+
+        group.notify(queue: workQueue) {
+            lock.lock(); let ok = !failed; lock.unlock()
+            guard ok else { completion(nil); return }
+            let masterURL = dir.appendingPathComponent("master.m3u8")
+            do {
+                try rewritten.joined(separator: "\n").write(to: masterURL, atomically: true, encoding: .utf8)
+                completion(masterURL.path)
+            } catch {
+                completion(nil)
+            }
+        }
+    }
+
+    /// Collapse duplicate discontinuities + absolutize URIs.
+    func sanitizeMediaPlaylist(_ text: String, baseURL: URL) -> String {
+        let lines = text.components(separatedBy: .newlines)
+        var out: [String] = []
+        out.reserveCapacity(lines.count)
+        var previousWasDiscontinuity = false
+
+        for rawLine in lines {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            if line == "#EXT-X-DISCONTINUITY" {
+                // Drop back-to-back duplicates (spec meaningless, demuxer hazard).
+                if previousWasDiscontinuity { continue }
+                previousWasDiscontinuity = true
+                out.append(rawLine)
+                continue
+            }
+            previousWasDiscontinuity = false
+
+            if line.hasPrefix("#EXT-X-KEY:") {
+                out.append(Self.rewriteURIAttribute(rawLine, key: "URI", base: baseURL))
+            } else if line.hasPrefix("#EXT-X-MAP:") {
+                out.append(Self.rewriteURIAttribute(rawLine, key: "URI", base: baseURL))
+            } else if line.hasPrefix("#EXT-X-MEDIA:") {
+                out.append(Self.rewriteURIAttribute(rawLine, key: "URI", base: baseURL))
+            } else if !line.isEmpty, !line.hasPrefix("#") {
+                // Segment URI.
+                out.append(Self.absoluteURL(line, base: baseURL)?.absoluteString ?? rawLine)
+            } else {
+                out.append(rawLine)
+            }
+        }
+        return out.joined(separator: "\n")
+    }
+
+    // MARK: - Helpers
+
+    private func fetchText(
+        url: URL,
+        headers: [String: String],
+        completion: @escaping (String?) -> Void
+    ) {
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        for (key, value) in headers where !value.isEmpty {
+            request.setValue(value, forHTTPHeaderField: key)
+        }
+        session.dataTask(with: request) { data, response, _ in
+            guard
+                let data,
+                let http = response as? HTTPURLResponse,
+                (200..<300).contains(http.statusCode),
+                let text = String(data: data, encoding: .utf8),
+                !text.isEmpty
+            else {
+                completion(nil)
+                return
+            }
+            completion(text)
+        }.resume()
+    }
+
+    private func writeMediaPlaylist(_ body: String, suffix: String) -> URL? {
+        guard let dir = Self.makeTempDir() else { return nil }
+        let fileURL = dir.appendingPathComponent("\(suffix).m3u8")
+        do {
+            try body.write(to: fileURL, atomically: true, encoding: .utf8)
+            return fileURL
+        } catch {
+            return nil
+        }
+    }
+
+    private static func makeTempDir() -> URL? {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("nuvio-hls-\(UUID().uuidString)", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            return dir
+        } catch {
+            return nil
+        }
+    }
+
+    private static func absoluteURL(_ uri: String, base: URL) -> URL? {
+        if let url = URL(string: uri), url.scheme != nil { return url }
+        return URL(string: uri, relativeTo: base)?.absoluteURL
+    }
+
+    private static func attributeURI(_ line: String, key: String) -> String? {
+        // Matches KEY="value" with optional whitespace.
+        let pattern = key + "\\s*=\\s*\"([^\"]*)\""
+        guard
+            let regex = try? NSRegularExpression(pattern: pattern),
+            let match = regex.firstMatch(
+                in: line,
+                range: NSRange(line.startIndex..., in: line)
+            ),
+            let range = Range(match.range(at: 1), in: line)
+        else {
+            return nil
+        }
+        return String(line[range])
+    }
+
+    private static func rewriteURIAttribute(_ line: String, key: String, base: URL) -> String {
+        guard
+            let uri = attributeURI(line, key: key),
+            !uri.isEmpty,
+            let absolute = absoluteURL(uri, base: base)
+        else {
+            return line
+        }
+        let pattern = "(" + key + "\\s*=\\s*\")[^\"]*(\")"
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return line }
+        return regex.stringByReplacingMatches(
+            in: line,
+            range: NSRange(line.startIndex..., in: line),
+            withTemplate: "$1" + absolute.absoluteString + "$2"
+        )
+    }
+}
+
