@@ -300,7 +300,6 @@ final class MPVPlayerViewController: UIViewController {
     private var previousPollWasPlaying: Bool = false
     private var discontinuityRescuesUsed: Int = 0
     private var discontinuityRescueCooldownUntil: TimeInterval = 0
-    private var didLogDurationForLoad: Bool = false
 
     private func resetDiscontinuityGuard() {
         lastGoodPositionMs = 0
@@ -308,7 +307,6 @@ final class MPVPlayerViewController: UIViewController {
         previousPollWasPlaying = false
         discontinuityRescuesUsed = 0
         discontinuityRescueCooldownUntil = 0
-        didLogDurationForLoad = false
     }
 
     override var canBecomeFirstResponder: Bool {
@@ -639,7 +637,25 @@ final class MPVPlayerViewController: UIViewController {
         ) { [weak self] finalURL in
             guard let self else { return }
             guard self.mpv != nil else { return }
-            HLSPlaylistSanitizer.debugLog("loadfile: \(finalURL == request.urlString ? "ORIGINAL" : "SANITIZED LOCAL FILE")")
+            // Sanitized playlists are loaded from local files, and FFmpeg's file
+            // protocol only permits nested "file,crypto,data" resources by
+            // default (libavformat/file.c). Their remote https segments would be
+            // refused and mpv would demux the playlist as a plain list of
+            // segment files (segment-by-segment playback, tiny durations,
+            // stutter). Desktop mpv avoids this via its curl-based nested I/O;
+            // MPVKit's libmpv v0.41.0 does not have it. Widen the whitelist for
+            // nested URL opens so local playlists can reach their segments.
+            if finalURL != request.urlString {
+                self.command(
+                    "change-list",
+                    args: [
+                        "demuxer-lavf-o",
+                        "append",
+                        "protocol_whitelist=file,http,https,tls,tcp,udp,rtp,crypto,data,httpproxy"
+                    ],
+                    checkForErrors: false
+                )
+            }
             self.command("loadfile", args: [finalURL, "replace"])
         }
         if let audioUrl = request.audioUrl, !audioUrl.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -972,11 +988,6 @@ final class MPVPlayerViewController: UIViewController {
             syncNowPlayingPlaybackState(isPlaying: isPlayerPlaying)
         }
 
-        if !didLogDurationForLoad, durationMs > 0 {
-            didLogDurationForLoad = true
-            HLSPlaylistSanitizer.debugLog("mpv duration=\(durationMs)ms position=\(positionMs)ms")
-        }
-
         guardDiscontinuityReset(seeking: seeking, eofReached: eofReached)
     }
 
@@ -1009,7 +1020,6 @@ final class MPVPlayerViewController: UIViewController {
         discontinuityRescuesUsed += 1
         discontinuityRescueCooldownUntil = now + 5
         let rescueMs = lastGoodPositionMs
-        HLSPlaylistSanitizer.debugLog("RESCUE #\(discontinuityRescuesUsed): pos \(previousPollPositionMs)->\(positionMs), seeking back to \(rescueMs), duration=\(durationMs)")
         print("[MPV] Discontinuity reset detected (\(previousPollPositionMs) -> \(positionMs)), rescuing to \(rescueMs) (attempt \(discontinuityRescuesUsed))")
         if Thread.isMainThread {
             seekToMs(rescueMs)
@@ -1472,37 +1482,18 @@ final class HLSPlaylistSanitizer {
 
     private let workQueue = DispatchQueue(label: "hls-sanitizer", qos: .userInitiated)
 
-    static func debugLog(_ message: String) {
-        let line = "[\(Date())] \(message)\n"
-        if let data = line.data(using: .utf8),
-           let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
-            let file = docs.appendingPathComponent("nuvio-hls-debug.log")
-            if FileManager.default.fileExists(atPath: file.path),
-               let handle = try? FileHandle(forWritingTo: file) {
-                try? handle.seekToEnd()
-                try? handle.write(contentsOf: data)
-                try? handle.close()
-            } else {
-                try? data.write(to: file)
-            }
-        }
-        print("[HLS] \(message)")
-    }
-
     /// Resolve `urlString` to a playable URL, calling completion on main thread.
     func sanitizedURL(
         for urlString: String,
         headers: [String: String],
         completion: @escaping (String) -> Void
     ) {
-        Self.debugLog("sanitize request: \(urlString)")
         guard
             let url = URL(string: urlString),
             let scheme = url.scheme?.lowercased(),
             (scheme == "http" || scheme == "https"),
             url.pathExtension.lowercased() == "m3u8"
         else {
-            Self.debugLog("passthrough (not http m3u8)")
             completion(urlString)
             return
         }
@@ -1526,36 +1517,23 @@ final class HLSPlaylistSanitizer {
         completion: @escaping (String?) -> Void
     ) {
         fetchText(url: url, headers: headers) { [weak self] text in
-            guard let self, let text else {
-                Self.debugLog("fetch FAILED for \(url.lastPathComponent), fallback original")
-                completion(nil)
-                return
-            }
-            Self.debugLog("fetched \(url.lastPathComponent): \(text.count) chars, lines=\(text.components(separatedBy: .newlines).count)")
-            guard text.contains("#EXTM3U") else {
-                Self.debugLog("not a playlist, fallback original")
-                completion(nil)
-                return
-            }
+            guard let self, let text else { completion(nil); return }
+            guard text.contains("#EXTM3U") else { completion(nil); return }
 
             if text.contains("#EXT-X-STREAM-INF") {
-                Self.debugLog("master playlist: \(targets.count) variant/rendition targets")
                 self.rewriteMaster(text, baseURL: url, headers: headers, completion: completion)
             } else if text.contains("#EXT-X-ENDLIST") {
                 // VOD media playlist -> sanitize into a temp file.
-                let sanitized = self.sanitizeMediaPlaylist(text, baseURL: url)
-                let inDisc = text.components(separatedBy: "#EXT-X-DISCONTINUITY").count - 1
-                let outDisc = sanitized.components(separatedBy: "#EXT-X-DISCONTINUITY").count - 1
-                Self.debugLog("VOD media: discontinuities \(inDisc)->\(outDisc)")
-                if let fileURL = self.writeMediaPlaylist(sanitized, suffix: "media") {
-                    Self.debugLog("wrote sanitized file: \(fileURL.path)")
+                if let fileURL = self.writeMediaPlaylist(
+                    self.sanitizeMediaPlaylist(text, baseURL: url),
+                    suffix: "media"
+                ) {
                     completion(fileURL.path)
                 } else {
                     completion(nil)
                 }
             } else {
                 // Live / event playlist (no ENDLIST): do not touch.
-                Self.debugLog("LIVE playlist (no ENDLIST), passthrough original")
                 completion(nil)
             }
         }
