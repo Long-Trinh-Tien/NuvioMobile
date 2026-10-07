@@ -271,6 +271,7 @@ final class MPVPlayerViewController: UIViewController {
     private lazy var nowPlayingController = PlayerNowPlayingController(owner: self)
     private lazy var eventQueue = DispatchQueue(label: "mpv-events", qos: .userInitiated)
     private var recentPlaybackLogs: [String] = []
+    private var diagLavfLog: [String] = []
     private var activeRequestHeaders: [String: String] = [:]
     private var preferredAudioLanguages: [String] = []
 
@@ -492,6 +493,7 @@ final class MPVPlayerViewController: UIViewController {
     // MARK: - MPV Setup
 
     private func setupMpv() {
+        installLavfWhitelistConfig()
         mpv = mpv_create()
         guard mpv != nil else {
             print("[MPV] Failed to create mpv instance")
@@ -522,6 +524,7 @@ final class MPVPlayerViewController: UIViewController {
         checkError(mpv_set_option_string(mpv, "target-colorspace-hint", "yes"))
         checkError(mpv_set_option_string(mpv, "tone-mapping", "auto"))
         checkError(mpv_set_option_string(mpv, "hdr-compute-peak", "yes"))
+        setLavfNestedProtocolWhitelist()
 
         checkError(mpv_initialize(mpv))
         applyAudioLanguagePreferences(preferredAudioLanguages)
@@ -556,6 +559,95 @@ final class MPVPlayerViewController: UIViewController {
         }
         checkError(mpv_set_option_string(mpv, "sub-font", "Noto Sans CJK SC"))
         print("[MPV] Using bundled CJK subtitle font: \(fontURL.lastPathComponent)")
+    }
+
+    // MARK: - HLS local-playlist nested-protocol whitelist (build 141)
+
+    /// FFmpeg's file:// protocol only allows nested "file,crypto,data" resources
+    /// by default (libavformat/file.c default_whitelist), so a sanitized local
+    /// HLS playlist cannot open its remote https segments: the hls demuxer fails
+    /// and mpv falls back to demuxing the playlist as a plain list of segment
+    /// files (segment-by-segment playback, tiny durations). Desktop mpv avoids
+    /// this with its curl-based nested I/O; MPVKit's libmpv v0.41.0 does not
+    /// have it, so widen the nested protocol whitelist explicitly.
+    private static let lavfWhitelistPairs =
+        "protocol_whitelist=file,http,https,tls,tcp,udp,rtp,crypto,data,httpproxy"
+
+    /// Fallback mechanism: write an mpv.conf that the mpv core loads at
+    /// initialize; the config parser supports "-append" with full values.
+    private func installLavfWhitelistConfig() {
+        guard let home = ProcessInfo.processInfo.environment["HOME"] else { return }
+        let dir = URL(fileURLWithPath: home).appendingPathComponent(".config/mpv", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let conf = dir.appendingPathComponent("mpv.conf")
+        let text = "demuxer-lavf-o-append=\(Self.lavfWhitelistPairs)\n"
+        try? text.write(to: conf, atomically: true, encoding: .utf8)
+    }
+
+    /// Primary mechanism: set demuxer-lavf-o through the option API with a node
+    /// map (key/value list with string values; commas stay intact because the
+    /// map path copies pairs verbatim). Must run before mpv_initialize.
+    private func setLavfNestedProtocolWhitelist() {
+        guard let mpv = mpv else { return }
+        guard let key = strdup("protocol_whitelist"),
+              let value = strdup(Self.lavfWhitelistPairs) else { return }
+        defer {
+            free(key)
+            free(value)
+        }
+
+        let keys = UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>.allocate(capacity: 1)
+        keys[0] = key
+        defer { keys.deallocate() }
+
+        let values = UnsafeMutablePointer<mpv_node>.allocate(capacity: 1)
+        values[0] = mpv_node()
+        values[0].format = MPV_FORMAT_STRING
+        withUnsafeMutableBytes(of: &values[0]) { raw in
+            raw.storeBytes(of: value, toByteOffset: 0, as: UnsafeMutablePointer<CChar>.self)
+        }
+        defer { values.deallocate() }
+
+        let list = UnsafeMutablePointer<mpv_node_list>.allocate(capacity: 1)
+        list[0] = mpv_node_list()
+        list[0].num = 1
+        list[0].keys = keys
+        list[0].values = values
+        defer { list.deallocate() }
+
+        var node = mpv_node()
+        node.format = MPV_FORMAT_NODE_MAP
+        withUnsafeMutableBytes(of: &node) { raw in
+            raw.storeBytes(of: list, toByteOffset: 0, as: UnsafeMutablePointer<mpv_node_list>.self)
+        }
+
+        let err = mpv_set_option(mpv, "demuxer-lavf-o", MPV_FORMAT_NODE, &node)
+        print("[MPV][DIAG] demuxer-lavf-o node set -> \(err)")
+    }
+
+    /// Temporary on-device diagnostics for the local-playlist whitelist issue:
+    /// overlay the effective option value, demuxer, duration and the last
+    /// mpv/FFmpeg error line so a screenshot tells the whole story.
+    private func scheduleLavfDiagnostics(usedLocalFile: Bool) {
+        for delay in [6.0, 18.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self, self.mpv != nil else { return }
+                let wl = self.getString("demuxer-lavf-o") ?? "<none>"
+                let wlNs = self.getString("options/demuxer-lavf-o") ?? "<none>"
+                let dm = self.getString("current-demuxer") ?? "<none>"
+                let fmt = self.getString("file-format") ?? "<none>"
+                let dur = self.getDouble("duration")
+                self.errorStateLock.lock()
+                let logs = self.diagLavfLog
+                self.errorStateLock.unlock()
+                var text = "[DIAG v141] local=\(usedLocalFile ? 1 : 0) dm=\(dm) dur=\(Int(dur)) fmt=\(fmt) wl=\(wl) wlo=\(wlNs)"
+                if let last = logs.last {
+                    text += " | \(last)"
+                }
+                self.command("show-text", args: [text, "15000"], checkForErrors: false)
+                print("[MPV][DIAG] \(text)")
+            }
+        }
     }
 
     private func setupNotifications() {
@@ -651,12 +743,13 @@ final class MPVPlayerViewController: UIViewController {
                     args: [
                         "demuxer-lavf-o",
                         "append",
-                        "protocol_whitelist=file,http,https,tls,tcp,udp,rtp,crypto,data,httpproxy"
+                        Self.lavfWhitelistPairs
                     ],
                     checkForErrors: false
                 )
             }
             self.command("loadfile", args: [finalURL, "replace"])
+            self.scheduleLavfDiagnostics(usedLocalFile: finalURL != request.urlString)
         }
         if let audioUrl = request.audioUrl, !audioUrl.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
@@ -1235,6 +1328,10 @@ final class MPVPlayerViewController: UIViewController {
         recentPlaybackLogs.append(formatted)
         if recentPlaybackLogs.count > 4 {
             recentPlaybackLogs.removeFirst(recentPlaybackLogs.count - 4)
+        }
+        diagLavfLog.append(formatted)
+        if diagLavfLog.count > 8 {
+            diagLavfLog.removeFirst(diagLavfLog.count - 8)
         }
         errorStateLock.unlock()
     }
