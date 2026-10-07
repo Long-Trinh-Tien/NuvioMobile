@@ -1716,23 +1716,73 @@ final class HLSPlaylistSanitizer {
         }
     }
 
-    /// Collapse duplicate discontinuities + absolutize URIs.
+    /// Sanitize a VOD HLS media playlist for ad-spliced streams:
+    /// - Drop ad segments that sit between nearby `#EXT-X-DISCONTINUITY` markers.
+    ///   Ad clips carry their own near-zero timestamps while the movie keeps
+    ///   absolute presentation times; ffmpeg's HLS demuxer does not process the
+    ///   discontinuity tag at all (verified against n8.1.2 and current master),
+    ///   so the raw timestamp reset makes players jump back to ~0 unless the ad
+    ///   spans are removed. Movie segment timestamps are untouched, so subtitle
+    ///   timing and seek positions stay exactly as they were.
+    /// - Remove all discontinuity tags and absolutize URIs.
     func sanitizeMediaPlaylist(_ text: String, baseURL: URL) -> String {
         let lines = text.components(separatedBy: .newlines)
-        var out: [String] = []
-        out.reserveCapacity(lines.count)
-        var previousWasDiscontinuity = false
 
+        // 1) Collapse back-to-back duplicate discontinuity tags.
+        var collapsed: [String] = []
+        collapsed.reserveCapacity(lines.count)
+        var previousWasDiscontinuity = false
         for rawLine in lines {
             let line = rawLine.trimmingCharacters(in: .whitespaces)
             if line == "#EXT-X-DISCONTINUITY" {
-                // Drop back-to-back duplicates (spec meaningless, demuxer hazard).
                 if previousWasDiscontinuity { continue }
                 previousWasDiscontinuity = true
-                out.append(rawLine)
-                continue
+                collapsed.append(rawLine)
+            } else {
+                previousWasDiscontinuity = false
+                collapsed.append(rawLine)
             }
-            previousWasDiscontinuity = false
+        }
+
+        // 2) Mark ad spans: from one discontinuity up to (excluding) the next,
+        //    when the span looks like a short ad break.
+        var discontinuityIndexes: [Int] = []
+        for (index, rawLine) in collapsed.enumerated()
+            where rawLine.trimmingCharacters(in: .whitespaces) == "#EXT-X-DISCONTINUITY" {
+            discontinuityIndexes.append(index)
+        }
+
+        var dropped = [Bool](repeating: false, count: collapsed.count)
+        for (position, start) in discontinuityIndexes.enumerated() {
+            guard position + 1 < discontinuityIndexes.count else { continue }
+            let end = discontinuityIndexes[position + 1]
+            var segmentCount = 0
+            var duration = 0.0
+            var index = start + 1
+            while index < end {
+                let line = collapsed[index].trimmingCharacters(in: .whitespaces)
+                if line.hasPrefix("#EXTINF:") {
+                    segmentCount += 1
+                    let value = line.dropFirst("#EXTINF:".count)
+                        .split(separator: ",").first.map(String.init) ?? ""
+                    duration += Double(value) ?? 0
+                }
+                index += 1
+            }
+            if segmentCount > 0, segmentCount <= 30, duration <= 120.0 {
+                for index in start..<end {
+                    dropped[index] = true
+                }
+            }
+        }
+
+        // 3) Emit: skip dropped lines and every discontinuity tag, absolutize URIs.
+        var out: [String] = []
+        out.reserveCapacity(collapsed.count)
+        for (index, rawLine) in collapsed.enumerated() {
+            if dropped[index] { continue }
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            if line == "#EXT-X-DISCONTINUITY" { continue }
 
             if line.hasPrefix("#EXT-X-KEY:") {
                 out.append(Self.rewriteURIAttribute(rawLine, key: "URI", base: baseURL))
