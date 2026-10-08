@@ -640,7 +640,7 @@ final class MPVPlayerViewController: UIViewController {
                 self.errorStateLock.lock()
                 let logs = self.diagLavfLog
                 self.errorStateLock.unlock()
-                var text = "[DIAG v141] local=\(usedLocalFile ? 1 : 0) dm=\(dm) dur=\(Int(dur)) fmt=\(fmt) wl=\(wl) wlo=\(wlNs)"
+                var text = "[DIAG v143] local=\(usedLocalFile ? 1 : 0) dm=\(dm) dur=\(Int(dur)) fmt=\(fmt) sc=\(HLSPlaylistSanitizer.lastStats()) wl=\(wl) wlo=\(wlNs)"
                 if let last = logs.last {
                     text += " | \(last)"
                 }
@@ -1569,6 +1569,28 @@ final class HLSPlaylistSanitizer {
 
     static let shared = HLSPlaylistSanitizer()
 
+    // Build-143 diagnostics: last sanitize summary, shown on screen by the player.
+    private static let statsLock = NSLock()
+    private static var _lastStats = "(none)"
+    static func setLastStats(_ s: String) {
+        statsLock.lock(); _lastStats = s; statsLock.unlock()
+    }
+    static func lastStats() -> String {
+        statsLock.lock(); defer { statsLock.unlock() }
+        return _lastStats
+    }
+    private static func statsSummary(input: String, output: String, tag: String) -> String {
+        func count(_ t: String, _ p: (String) -> Bool) -> Int {
+            t.components(separatedBy: .newlines)
+                .filter { p($0.trimmingCharacters(in: .whitespaces)) }
+                .count
+        }
+        let inSegs = count(input) { $0.hasPrefix("#EXTINF:") }
+        let outSegs = count(output) { $0.hasPrefix("#EXTINF:") }
+        let disc = count(input) { $0 == "#EXT-X-DISCONTINUITY" }
+        return "\(tag) vin=\(input.utf8.count) seg=\(inSegs)>\(outSegs) disc=\(disc)"
+    }
+
     private let session: URLSession = {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 12
@@ -1621,10 +1643,9 @@ final class HLSPlaylistSanitizer {
                 self.rewriteMaster(text, baseURL: url, headers: headers, completion: completion)
             } else if text.contains("#EXT-X-ENDLIST") {
                 // VOD media playlist -> sanitize into a temp file.
-                if let fileURL = self.writeMediaPlaylist(
-                    self.sanitizeMediaPlaylist(text, baseURL: url),
-                    suffix: "media"
-                ) {
+                let body = self.sanitizeMediaPlaylist(text, baseURL: url)
+                Self.setLastStats(Self.statsSummary(input: text, output: body, tag: "media"))
+                if let fileURL = self.writeMediaPlaylist(body, suffix: "media") {
                     completion(fileURL.path)
                 } else {
                     completion(nil)
@@ -1682,10 +1703,13 @@ final class HLSPlaylistSanitizer {
                     let body: String
                     if mediaText.contains("#EXT-X-STREAM-INF") {
                         body = mediaText // nested master: absolutize only
+                        Self.setLastStats("nested vin=\(mediaText.utf8.count)")
                     } else if mediaText.contains("#EXT-X-ENDLIST") {
                         body = self.sanitizeMediaPlaylist(mediaText, baseURL: absolute)
+                        Self.setLastStats(Self.statsSummary(input: mediaText, output: body, tag: "variant"))
                     } else {
                         body = mediaText
+                        Self.setLastStats("noendlist vin=\(mediaText.utf8.count)")
                     }
                     let fileName = "v\(index).m3u8"
                     let fileURL = dir.appendingPathComponent(fileName)
