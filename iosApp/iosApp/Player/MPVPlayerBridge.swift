@@ -640,7 +640,7 @@ final class MPVPlayerViewController: UIViewController {
                 self.errorStateLock.lock()
                 let logs = self.diagLavfLog
                 self.errorStateLock.unlock()
-                var text = "[DIAG v143] local=\(usedLocalFile ? 1 : 0) dm=\(dm) dur=\(Int(dur)) fmt=\(fmt) sc=\(HLSPlaylistSanitizer.lastStats()) wl=\(wl) wlo=\(wlNs)"
+                var text = "[DIAG v144] local=\(usedLocalFile ? 1 : 0) dm=\(dm) dur=\(Int(dur)) fmt=\(fmt) sc=\(HLSPlaylistSanitizer.lastStats()) wl=\(wl) wlo=\(wlNs)"
                 if let last = logs.last {
                     text += " | \(last)"
                 }
@@ -1777,6 +1777,7 @@ final class HLSPlaylistSanitizer {
         }
 
         var dropped = [Bool](repeating: false, count: collapsed.count)
+        var spanInfos: [(start: Int, end: Int, droppedDuration: Double, segmentCount: Int)] = []
         for (position, start) in discontinuityIndexes.enumerated() {
             guard position + 1 < discontinuityIndexes.count else { continue }
             let end = discontinuityIndexes[position + 1]
@@ -1797,7 +1798,49 @@ final class HLSPlaylistSanitizer {
                 for index in start..<end {
                     dropped[index] = true
                 }
+                spanInfos.append((start, end, duration, segmentCount))
             }
+        }
+
+        // Group consecutive spans into clusters. When a cluster marks a real
+        // timeline hole (each of its segments individually tagged with a
+        // discontinuity — the movie around it was re-timed), pad the first
+        // surviving segment after the cluster by the dropped duration, so the
+        // demuxer's EXTINF-based seek map keeps matching the stream's
+        // presentation timestamps. Clusters with only boundary tags leave the
+        // movie timeline continuous, so nothing is padded.
+        var extinfAdjustments: [Int: Double] = [:]
+        var clusterPos = 0
+        while clusterPos < spanInfos.count {
+            var clusterEnd = clusterPos
+            var total = 0.0
+            var segments = 0
+            var discCount = 0
+            while true {
+                let span = spanInfos[clusterEnd]
+                total += span.droppedDuration
+                segments += span.segmentCount
+                for index in span.start..<span.end
+                    where collapsed[index].trimmingCharacters(in: .whitespaces) == "#EXT-X-DISCONTINUITY" {
+                    discCount += 1
+                }
+                if clusterEnd + 1 < spanInfos.count, spanInfos[clusterEnd + 1].start == span.end {
+                    clusterEnd += 1
+                } else {
+                    break
+                }
+            }
+            if discCount >= segments, segments > 0 {
+                var k = spanInfos[clusterEnd].end
+                while k < collapsed.count,
+                      dropped[k] || !collapsed[k].trimmingCharacters(in: .whitespaces).hasPrefix("#EXTINF:") {
+                    k += 1
+                }
+                if k < collapsed.count {
+                    extinfAdjustments[k, default: 0] += total
+                }
+            }
+            clusterPos = clusterEnd + 1
         }
 
         // 3) Emit: skip dropped lines and every discontinuity tag, absolutize URIs.
@@ -1807,6 +1850,19 @@ final class HLSPlaylistSanitizer {
             if dropped[index] { continue }
             let line = rawLine.trimmingCharacters(in: .whitespaces)
             if line == "#EXT-X-DISCONTINUITY" { continue }
+
+            if line.hasPrefix("#EXTINF:") {
+                if let adjust = extinfAdjustments[index] {
+                    let value = line.dropFirst("#EXTINF:".count)
+                        .split(separator: ",").first.map(String.init) ?? ""
+                    if let duration = Double(value) {
+                        out.append(String(format: "#EXTINF:%.3f,", duration + adjust))
+                        continue
+                    }
+                }
+                out.append(rawLine)
+                continue
+            }
 
             if line.hasPrefix("#EXT-X-KEY:") {
                 out.append(Self.rewriteURIAttribute(rawLine, key: "URI", base: baseURL))
