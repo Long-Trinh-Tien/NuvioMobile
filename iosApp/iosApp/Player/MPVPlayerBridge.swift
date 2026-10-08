@@ -271,7 +271,6 @@ final class MPVPlayerViewController: UIViewController {
     private lazy var nowPlayingController = PlayerNowPlayingController(owner: self)
     private lazy var eventQueue = DispatchQueue(label: "mpv-events", qos: .userInitiated)
     private var recentPlaybackLogs: [String] = []
-    private var diagLavfLog: [String] = []
     private var activeRequestHeaders: [String: String] = [:]
     private var preferredAudioLanguages: [String] = []
 
@@ -622,32 +621,7 @@ final class MPVPlayerViewController: UIViewController {
         }
 
         let err = mpv_set_option(mpv, "demuxer-lavf-o", MPV_FORMAT_NODE, &node)
-        print("[MPV][DIAG] demuxer-lavf-o node set -> \(err)")
-    }
-
-    /// Temporary on-device diagnostics for the local-playlist whitelist issue:
-    /// overlay the effective option value, demuxer, duration and the last
-    /// mpv/FFmpeg error line so a screenshot tells the whole story.
-    private func scheduleLavfDiagnostics(usedLocalFile: Bool) {
-        for delay in [6.0, 18.0] {
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-                guard let self, self.mpv != nil else { return }
-                let wl = self.getString("demuxer-lavf-o") ?? "<none>"
-                let wlNs = self.getString("options/demuxer-lavf-o") ?? "<none>"
-                let dm = self.getString("current-demuxer") ?? "<none>"
-                let fmt = self.getString("file-format") ?? "<none>"
-                let dur = self.getDouble("duration")
-                self.errorStateLock.lock()
-                let logs = self.diagLavfLog
-                self.errorStateLock.unlock()
-                var text = "[DIAG v144] local=\(usedLocalFile ? 1 : 0) dm=\(dm) dur=\(Int(dur)) fmt=\(fmt) sc=\(HLSPlaylistSanitizer.lastStats()) wl=\(wl) wlo=\(wlNs)"
-                if let last = logs.last {
-                    text += " | \(last)"
-                }
-                self.command("show-text", args: [text, "15000"], checkForErrors: false)
-                print("[MPV][DIAG] \(text)")
-            }
-        }
+        print("[MPV] demuxer-lavf-o node set -> \(err)")
     }
 
     private func setupNotifications() {
@@ -749,7 +723,6 @@ final class MPVPlayerViewController: UIViewController {
                 )
             }
             self.command("loadfile", args: [finalURL, "replace"])
-            self.scheduleLavfDiagnostics(usedLocalFile: finalURL != request.urlString)
         }
         if let audioUrl = request.audioUrl, !audioUrl.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
@@ -1329,10 +1302,6 @@ final class MPVPlayerViewController: UIViewController {
         if recentPlaybackLogs.count > 4 {
             recentPlaybackLogs.removeFirst(recentPlaybackLogs.count - 4)
         }
-        diagLavfLog.append(formatted)
-        if diagLavfLog.count > 8 {
-            diagLavfLog.removeFirst(diagLavfLog.count - 8)
-        }
         errorStateLock.unlock()
     }
 
@@ -1569,28 +1538,6 @@ final class HLSPlaylistSanitizer {
 
     static let shared = HLSPlaylistSanitizer()
 
-    // Build-143 diagnostics: last sanitize summary, shown on screen by the player.
-    private static let statsLock = NSLock()
-    private static var _lastStats = "(none)"
-    static func setLastStats(_ s: String) {
-        statsLock.lock(); _lastStats = s; statsLock.unlock()
-    }
-    static func lastStats() -> String {
-        statsLock.lock(); defer { statsLock.unlock() }
-        return _lastStats
-    }
-    private static func statsSummary(input: String, output: String, tag: String) -> String {
-        func count(_ t: String, _ p: (String) -> Bool) -> Int {
-            t.components(separatedBy: .newlines)
-                .filter { p($0.trimmingCharacters(in: .whitespaces)) }
-                .count
-        }
-        let inSegs = count(input) { $0.hasPrefix("#EXTINF:") }
-        let outSegs = count(output) { $0.hasPrefix("#EXTINF:") }
-        let disc = count(input) { $0 == "#EXT-X-DISCONTINUITY" }
-        return "\(tag) vin=\(input.utf8.count) seg=\(inSegs)>\(outSegs) disc=\(disc)"
-    }
-
     private let session: URLSession = {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 12
@@ -1644,7 +1591,6 @@ final class HLSPlaylistSanitizer {
             } else if text.contains("#EXT-X-ENDLIST") {
                 // VOD media playlist -> sanitize into a temp file.
                 let body = self.sanitizeMediaPlaylist(text, baseURL: url)
-                Self.setLastStats(Self.statsSummary(input: text, output: body, tag: "media"))
                 if let fileURL = self.writeMediaPlaylist(body, suffix: "media") {
                     completion(fileURL.path)
                 } else {
@@ -1703,13 +1649,10 @@ final class HLSPlaylistSanitizer {
                     let body: String
                     if mediaText.contains("#EXT-X-STREAM-INF") {
                         body = mediaText // nested master: absolutize only
-                        Self.setLastStats("nested vin=\(mediaText.utf8.count)")
                     } else if mediaText.contains("#EXT-X-ENDLIST") {
                         body = self.sanitizeMediaPlaylist(mediaText, baseURL: absolute)
-                        Self.setLastStats(Self.statsSummary(input: mediaText, output: body, tag: "variant"))
                     } else {
                         body = mediaText
-                        Self.setLastStats("noendlist vin=\(mediaText.utf8.count)")
                     }
                     let fileName = "v\(index).m3u8"
                     let fileURL = dir.appendingPathComponent(fileName)
