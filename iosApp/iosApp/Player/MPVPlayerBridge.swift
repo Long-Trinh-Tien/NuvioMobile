@@ -301,12 +301,29 @@ final class MPVPlayerViewController: UIViewController {
     private var discontinuityRescuesUsed: Int = 0
     private var discontinuityRescueCooldownUntil: TimeInterval = 0
 
+    // User-facing timeline healing: after the sanitizer removes an ad cluster
+    // that occupied real time in the movie clock, raw time-pos jumps forward
+    // by the removed amount. These holes let the player show a continuous
+    // clock and convert user seeks back into raw (mpv) targets.
+    struct TimelineHole {
+        var start: Double       // raw seconds where the gap begins
+        var size: Double        // seconds removed at the gap
+        var observed: Bool = false
+    }
+    var timelineHoles: [TimelineHole] = []
+    private var previousRawPosition: Double = 0
+    private var previousPollWasPaused: Bool = false
+    private var holeDetectionMuteUntil: TimeInterval = 0
+
     private func resetDiscontinuityGuard() {
         lastGoodPositionMs = 0
         previousPollPositionMs = 0
         previousPollWasPlaying = false
+        previousPollWasPaused = false
         discontinuityRescuesUsed = 0
         discontinuityRescueCooldownUntil = 0
+        previousRawPosition = 0
+        holeDetectionMuteUntil = 0
     }
 
     override var canBecomeFirstResponder: Bool {
@@ -712,6 +729,10 @@ final class MPVPlayerViewController: UIViewController {
             // MPVKit's libmpv v0.41.0 does not have it. Widen the whitelist for
             // nested URL opens so local playlists can reach their segments.
             if finalURL != request.urlString {
+                self.timelineHoles = HLSPlaylistSanitizer.lastHoles.map {
+                    TimelineHole(start: $0.start, size: $0.size)
+                }
+                print("[MPV] timeline holes: \(self.timelineHoles.count)")
                 self.command(
                     "change-list",
                     args: [
@@ -721,6 +742,8 @@ final class MPVPlayerViewController: UIViewController {
                     ],
                     checkForErrors: false
                 )
+            } else {
+                self.timelineHoles = []
             }
             self.command("loadfile", args: [finalURL, "replace"])
         }
@@ -775,15 +798,19 @@ final class MPVPlayerViewController: UIViewController {
 
     func seekToMs(_ ms: Int64) {
         guard mpv != nil else { return }
-        let seconds = Double(ms) / 1000.0
-        command("seek", args: [String(format: "%.3f", seconds), "absolute"])
+        let rawSeconds = rawPosition(fromUI: Double(ms) / 1000.0)
+        muteHoleDetection(for: 3)
+        command("seek", args: [String(format: "%.3f", rawSeconds), "absolute"])
     }
 
     func seekByMs(_ ms: Int64, exact: Bool = false) {
         guard mpv != nil else { return }
-        let seconds = Double(ms) / 1000.0
-        let seekMode = exact ? "relative+exact" : "relative"
-        command("seek", args: [String(format: "%.3f", seconds), seekMode])
+        let rawNow = max(getDouble("time-pos"), 0)
+        let targetUI = uiPosition(fromRaw: rawNow) + Double(ms) / 1000.0
+        let rawTarget = rawPosition(fromUI: max(targetUI, 0))
+        muteHoleDetection(for: 3)
+        let seekMode = exact ? "absolute+exact" : "absolute"
+        command("seek", args: [String(format: "%.3f", rawTarget), seekMode])
     }
 
     func retryPlayback() {
@@ -792,6 +819,7 @@ final class MPVPlayerViewController: UIViewController {
             clearPlaybackError()
             applyRequestHeaders(activeRequestHeaders)
             let pos = getDouble("time-pos")
+            muteHoleDetection(for: 5)
             command("loadfile", args: [path, "replace"])
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
                 self?.command("seek", args: [String(format: "%.3f", pos), "absolute"])
@@ -1044,9 +1072,13 @@ final class MPVPlayerViewController: UIViewController {
         isPlayerLoading = (idle && !paused && !eofReached) || seeking || bufferingCache
         isPlayerPlaying = !paused && !idle && !eofReached
         isPlayerEnded = eofReached
-        durationMs = Int64(duration * 1000)
-        positionMs = Int64(max(position, 0) * 1000)
-        bufferedMs = Int64(max(position + cached, 0) * 1000)
+
+        let rawPosition = max(position, 0)
+        detectTimelineHoleCrossing(raw: rawPosition, seeking: seeking, paused: paused)
+        previousPollWasPaused = paused
+        durationMs = Int64(max(duration - totalHoleSeconds, 0) * 1000)
+        positionMs = Int64(uiPosition(fromRaw: rawPosition) * 1000)
+        bufferedMs = Int64(uiPosition(fromRaw: max(position + cached, 0)) * 1000)
         currentSpeed = Float(speed > 0 ? speed : 1.0)
 
         let shouldPublishNowPlayingState = !isPlayerLoading || isPlayerPlaying || durationMs > 0 || positionMs > 0
@@ -1091,6 +1123,68 @@ final class MPVPlayerViewController: UIViewController {
             seekToMs(rescueMs)
         } else {
             DispatchQueue.main.async { [weak self] in self?.seekToMs(rescueMs) }
+        }
+    }
+
+    // MARK: - Timeline healing (removed ad gaps)
+
+    private var totalHoleSeconds: Double {
+        timelineHoles.reduce(0) { $0 + $1.size }
+    }
+
+    /// Raw (presentation) position -> user-facing continuous position.
+    private func uiPosition(fromRaw raw: Double) -> Double {
+        guard !timelineHoles.isEmpty, raw > 0 else { return raw }
+        var ui = raw
+        for hole in timelineHoles where hole.observed && raw > hole.start {
+            ui -= hole.size
+        }
+        return max(ui, 0)
+    }
+
+    /// User-facing position -> raw seek target. Holes the target passes become
+    /// observed so the clock stays consistent after the seek lands.
+    private func rawPosition(fromUI ui: Double) -> Double {
+        guard !timelineHoles.isEmpty else { return max(ui, 0) }
+        var raw = max(ui, 0)
+        for _ in 0..<4 {
+            var next = max(ui, 0)
+            for (index, hole) in timelineHoles.enumerated() where raw > hole.start {
+                next += hole.size
+                timelineHoles[index].observed = true
+            }
+            if abs(next - raw) < 0.001 {
+                raw = next
+                break
+            }
+            raw = next
+        }
+        return raw
+    }
+
+    private func muteHoleDetection(for seconds: TimeInterval) {
+        holeDetectionMuteUntil = ProcessInfo.processInfo.systemUptime + seconds
+    }
+
+    /// Playback crossing a removed-ad gap makes raw time-pos jump forward by
+    /// the gap size; pin the matching hole to the exact crossing point.
+    private func detectTimelineHoleCrossing(raw: Double, seeking: Bool, paused: Bool) {
+        defer { previousRawPosition = raw }
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now >= holeDetectionMuteUntil else { return }
+        guard !seeking, !paused, !previousPollWasPaused else { return }
+        let delta = raw - previousRawPosition
+        guard delta > 5.0, raw > 120, previousRawPosition > 30 else { return }
+        if let index = timelineHoles.firstIndex(where: {
+            $0.start <= previousRawPosition + 2.0 && $0.start >= previousRawPosition - 30.0
+        }) {
+            timelineHoles[index].start = previousRawPosition
+            timelineHoles[index].size = delta
+            timelineHoles[index].observed = true
+            print("[MPV] timeline hole \(index) observed at \(previousRawPosition) size \(delta)")
+        } else {
+            timelineHoles.append(TimelineHole(start: previousRawPosition, size: delta, observed: true))
+            print("[MPV] timeline hole (unknown) observed at \(previousRawPosition) size \(delta)")
         }
     }
 
@@ -1538,6 +1632,27 @@ final class HLSPlaylistSanitizer {
 
     static let shared = HLSPlaylistSanitizer()
 
+    /// A gap in the stream's presentation clock left behind after removing an
+    /// ad cluster whose ads occupied real time in the movie timeline (clusters
+    /// where every ad segment carried its own discontinuity tag). `start` is
+    /// the playlist position where the gap begins (seconds), `size` the number
+    /// of seconds removed.
+    struct TimelineHole {
+        var start: Double
+        var size: Double
+    }
+
+    /// Holes found while sanitizing the most recent playlist. The player reads
+    /// this to present a continuous user-facing timeline (no clock jump at the
+    /// removed ad breaks). Guarded by `holesLock` (sanitizer runs on its work
+    /// queue, the player reads on the main thread).
+    private static let holesLock = NSLock()
+    private static var _lastHoles: [TimelineHole] = []
+    static var lastHoles: [TimelineHole] {
+        get { holesLock.lock(); defer { holesLock.unlock() }; return _lastHoles }
+        set { holesLock.lock(); _lastHoles = newValue; holesLock.unlock() }
+    }
+
     private let session: URLSession = {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 12
@@ -1569,6 +1684,7 @@ final class HLSPlaylistSanitizer {
                 DispatchQueue.main.async { completion(urlString) }
                 return
             }
+            HLSPlaylistSanitizer.lastHoles = []
             self.rewritePlaylist(at: url, headers: headers) { localURL in
                 DispatchQueue.main.async { completion(localURL ?? urlString) }
             }
@@ -1590,8 +1706,9 @@ final class HLSPlaylistSanitizer {
                 self.rewriteMaster(text, baseURL: url, headers: headers, completion: completion)
             } else if text.contains("#EXT-X-ENDLIST") {
                 // VOD media playlist -> sanitize into a temp file.
-                let body = self.sanitizeMediaPlaylist(text, baseURL: url)
-                if let fileURL = self.writeMediaPlaylist(body, suffix: "media") {
+                let sanitized = self.sanitizeMediaPlaylist(text, baseURL: url)
+                HLSPlaylistSanitizer.lastHoles = sanitized.holes
+                if let fileURL = self.writeMediaPlaylist(sanitized.body, suffix: "media") {
                     completion(fileURL.path)
                 } else {
                     completion(nil)
@@ -1650,7 +1767,15 @@ final class HLSPlaylistSanitizer {
                     if mediaText.contains("#EXT-X-STREAM-INF") {
                         body = mediaText // nested master: absolutize only
                     } else if mediaText.contains("#EXT-X-ENDLIST") {
-                        body = self.sanitizeMediaPlaylist(mediaText, baseURL: absolute)
+                        let sanitized = self.sanitizeMediaPlaylist(mediaText, baseURL: absolute)
+                        body = sanitized.body
+                        if !sanitized.holes.isEmpty {
+                            lock.lock()
+                            if HLSPlaylistSanitizer.lastHoles.isEmpty {
+                                HLSPlaylistSanitizer.lastHoles = sanitized.holes
+                            }
+                            lock.unlock()
+                        }
                     } else {
                         body = mediaText
                     }
@@ -1692,7 +1817,7 @@ final class HLSPlaylistSanitizer {
     ///   spans are removed. Movie segment timestamps are untouched, so subtitle
     ///   timing and seek positions stay exactly as they were.
     /// - Remove all discontinuity tags and absolutize URIs.
-    func sanitizeMediaPlaylist(_ text: String, baseURL: URL) -> String {
+    func sanitizeMediaPlaylist(_ text: String, baseURL: URL) -> (body: String, holes: [TimelineHole]) {
         let lines = text.components(separatedBy: .newlines)
 
         // 1) Collapse back-to-back duplicate discontinuity tags.
@@ -1753,6 +1878,8 @@ final class HLSPlaylistSanitizer {
         // presentation timestamps. Clusters with only boundary tags leave the
         // movie timeline continuous, so nothing is padded.
         var extinfAdjustments: [Int: Double] = [:]
+        var holes: [TimelineHole] = []
+        var holeShift = 0.0
         var clusterPos = 0
         while clusterPos < spanInfos.count {
             var clusterEnd = clusterPos
@@ -1781,6 +1908,19 @@ final class HLSPlaylistSanitizer {
                 }
                 if k < collapsed.count {
                     extinfAdjustments[k, default: 0] += total
+                    // Record the timeline hole so the player can show a
+                    // continuous clock (raw time-pos keeps the removed gap).
+                    var start = 0.0
+                    for index in 0..<spanInfos[clusterPos].start where !dropped[index] {
+                        let line = collapsed[index].trimmingCharacters(in: .whitespaces)
+                        if line.hasPrefix("#EXTINF:") {
+                            let value = line.dropFirst("#EXTINF:".count)
+                                .split(separator: ",").first.map(String.init) ?? ""
+                            start += Double(value) ?? 0
+                        }
+                    }
+                    holes.append(TimelineHole(start: start + holeShift, size: total))
+                    holeShift += total
                 }
             }
             clusterPos = clusterEnd + 1
@@ -1820,7 +1960,7 @@ final class HLSPlaylistSanitizer {
                 out.append(rawLine)
             }
         }
-        return out.joined(separator: "\n")
+        return (out.joined(separator: "\n"), holes)
     }
 
     // MARK: - Helpers
