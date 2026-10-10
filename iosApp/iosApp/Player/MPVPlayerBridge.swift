@@ -1,6 +1,7 @@
 import Foundation
 import UIKit
 import AVFoundation
+import AVKit
 import Libmpv
 import ComposeApp
 
@@ -249,7 +250,7 @@ private struct PendingLoadRequest {
 
 // MARK: - MPV Player View Controller
 
-final class MPVPlayerViewController: UIViewController {
+final class MPVPlayerViewController: UIViewController, AVPictureInPictureControllerDelegate, AVPictureInPictureSampleBufferPlaybackDelegate {
 
     private static let defaultAudioOutput = "audiounit"
 
@@ -260,8 +261,12 @@ final class MPVPlayerViewController: UIViewController {
     }
 
     private let errorStateLock = NSLock()
-    private var metalLayer = MetalLayer()
-    private var lastAppliedDrawableSize: CGSize = .zero
+    // iOS video surface: the mpv `avfoundation` VO renders into this
+    // AVSampleBufferDisplayLayer; it also serves as the PiP content source.
+    private var videoLayer = AVSampleBufferDisplayLayer()
+    private var pipController: AVPictureInPictureController?
+    private var isPipActive = false
+    private var pipStopForForeground = false
     private var externallyManagedViewSize: CGSize?
     private var pendingSurfaceLayoutWorkItems: [DispatchWorkItem] = []
     private var pendingLoadRequest: PendingLoadRequest?
@@ -353,20 +358,114 @@ final class MPVPlayerViewController: UIViewController {
         view.backgroundColor = .black
         view.layer.masksToBounds = true
 
-        metalLayer.contentsGravity = .resize
-        metalLayer.contentsScale = view.window?.screen.nativeScale ?? UIScreen.main.nativeScale
-        metalLayer.framebufferOnly = true
-        metalLayer.backgroundColor = UIColor.black.cgColor
-        metalLayer.wantsExtendedDynamicRangeContent = true
-        metalLayer.anchorPoint = CGPoint(x: 0, y: 0)
-        metalLayer.position = .zero
-        view.layer.addSublayer(metalLayer)
-        layoutMetalLayer()
+        videoLayer.contentsGravity = .resize
+        videoLayer.contentsScale = view.window?.screen.nativeScale ?? UIScreen.main.nativeScale
+        videoLayer.backgroundColor = UIColor.black.cgColor
+        videoLayer.videoGravity = .resizeAspect
+        videoLayer.anchorPoint = CGPoint(x: 0, y: 0)
+        videoLayer.position = .zero
+        view.layer.addSublayer(videoLayer)
+        layoutVideoLayer()
+        setupPictureInPicture()
 
         setupMpv()
         activateAudioSessionForPlayback()
         setupNotifications()
         refreshImmersiveSystemUI()
+    }
+
+    // MARK: - Picture in Picture
+
+    private func setupPictureInPicture() {
+        guard AVPictureInPictureController.isPictureInPictureSupported() else { return }
+
+        // Drive the display layer from the host clock so enqueued frames present
+        // smoothly and the PiP window has a valid timebase.
+        var timebase: CMTimebase?
+        if CMTimebaseCreateWithSourceClock(allocator: kCFAllocatorDefault,
+                                           sourceClock: CMClockGetHostTimeClock(),
+                                           timebaseOut: &timebase) == noErr,
+           let timebase = timebase {
+            videoLayer.controlTimebase = timebase
+            CMTimebaseSetTime(timebase, time: .zero)
+            CMTimebaseSetRate(timebase, rate: 1.0)
+        }
+
+        let source = AVPictureInPictureController.ContentSource(
+            sampleBufferDisplayLayer: videoLayer,
+            playbackDelegate: self
+        )
+        let controller = AVPictureInPictureController(contentSource: source)
+        controller.delegate = self
+        controller.canStartPictureInPictureAutomaticallyFromInline = true
+        pipController = controller
+        print("[PiP] ready (auto-start from inline enabled)")
+    }
+
+    // MARK: - AVPictureInPictureControllerDelegate
+
+    func pictureInPictureControllerDidStartPictureInPicture(_ controller: AVPictureInPictureController) {
+        isPipActive = true
+        print("[PiP] started")
+    }
+
+    func pictureInPictureControllerDidStopPictureInPicture(_ controller: AVPictureInPictureController) {
+        isPipActive = false
+        if pipStopForForeground {
+            pipStopForForeground = false
+        } else {
+            // The user closed the floating window: stop playback.
+            pausePlayback()
+        }
+        print("[PiP] stopped")
+    }
+
+    func pictureInPictureController(
+        _ controller: AVPictureInPictureController,
+        failedToStartPictureInPictureWithError error: Error
+    ) {
+        print("[PiP] failed to start: \(error.localizedDescription)")
+    }
+
+    // MARK: - AVPictureInPictureSampleBufferPlaybackDelegate
+
+    func pictureInPictureController(_ controller: AVPictureInPictureController, setPlaying playing: Bool) {
+        if playing {
+            playPlayback()
+        } else {
+            pausePlayback()
+        }
+    }
+
+    func pictureInPictureController(
+        _ controller: AVPictureInPictureController,
+        didTransitionToRenderSize newSize: CMVideoDimensions
+    ) {}
+
+    func pictureInPictureController(
+        _ controller: AVPictureInPictureController,
+        skipByInterval skipInterval: CMTime,
+        completion: @escaping () -> Void
+    ) {
+        let milliseconds = Int64((skipInterval.seconds * 1000).rounded())
+        if milliseconds != 0 {
+            seekByMs(milliseconds)
+        }
+        completion()
+    }
+
+    func pictureInPictureControllerIsPlaybackPaused(_ controller: AVPictureInPictureController) -> Bool {
+        return !isPlayerPlaying
+    }
+
+    func pictureInPictureControllerTimeRangeForPlayback(
+        _ controller: AVPictureInPictureController
+    ) -> CMTimeRange {
+        let durationSeconds = Double(durationMs) / 1000.0
+        if durationSeconds <= 0 {
+            return CMTimeRange(start: .negativeInfinity, duration: .positiveInfinity)
+        }
+        return CMTimeRange(start: .zero, duration: CMTime(seconds: durationSeconds, preferredTimescale: 600))
     }
 
     override func viewWillAppear(_ animated: Bool) {
@@ -376,7 +475,7 @@ final class MPVPlayerViewController: UIViewController {
 
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
-        layoutMetalLayer()
+        layoutVideoLayer()
         attemptStartPendingLoad()
     }
 
@@ -450,7 +549,7 @@ final class MPVPlayerViewController: UIViewController {
         }
         view.setNeedsLayout()
         view.layoutIfNeeded()
-        layoutMetalLayer()
+        layoutVideoLayer()
 
         if scheduleDeferredPasses {
             scheduleDeferredSurfaceLayoutPasses()
@@ -483,26 +582,17 @@ final class MPVPlayerViewController: UIViewController {
         }
     }
 
-    private func layoutMetalLayer() {
+    private func layoutVideoLayer() {
         let bounds = CGRect(origin: .zero, size: externallyManagedViewSize ?? view.bounds.size)
         guard bounds.width > 1, bounds.height > 1 else { return }
 
         let scale = view.window?.screen.nativeScale ?? UIScreen.main.nativeScale
-        let drawableSize = CGSize(
-            width: (bounds.width * scale).rounded(.toNearestOrAwayFromZero),
-            height: (bounds.height * scale).rounded(.toNearestOrAwayFromZero)
-        )
 
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        metalLayer.contentsScale = scale
-        metalLayer.position = .zero
-        metalLayer.bounds = CGRect(origin: .zero, size: bounds.size)
-        if drawableSize != lastAppliedDrawableSize {
-            // mpv's moltenvk context polls drawableSize and resizes its swapchain.
-            metalLayer.drawableSize = drawableSize
-            lastAppliedDrawableSize = drawableSize
-        }
+        videoLayer.contentsScale = scale
+        videoLayer.position = .zero
+        videoLayer.bounds = CGRect(origin: .zero, size: bounds.size)
         CATransaction.commit()
     }
 
@@ -518,20 +608,14 @@ final class MPVPlayerViewController: UIViewController {
 
         checkError(mpv_request_log_messages(mpv, "warn"))
 
-        var layerPointer = Int64(Int(bitPattern: Unmanaged.passUnretained(metalLayer).toOpaque()))
+        var layerPointer = Int64(Int(bitPattern: Unmanaged.passUnretained(videoLayer).toOpaque()))
         checkError(mpv_set_option(mpv, "wid", MPV_FORMAT_INT64, &layerPointer))
-        checkError(mpv_set_option_string(mpv, "vo", "gpu-next"))
-        checkError(mpv_set_option_string(mpv, "gpu-api", "vulkan"))
-        checkError(mpv_set_option_string(mpv, "gpu-context", "moltenvk"))
+        checkError(mpv_set_option_string(mpv, "vo", "avfoundation"))
+        checkError(mpv_set_option_string(mpv, "avfoundation-composite-osd", "yes"))
         checkError(mpv_set_option_string(mpv, "hwdec", "videotoolbox"))
         checkError(mpv_set_option_string(mpv, "ao", Self.defaultAudioOutput))
         checkError(mpv_set_option_string(mpv, "audio-channels", "auto"))
         checkError(mpv_set_option_string(mpv, "audio-fallback-to-null", "yes"))
-        checkError(mpv_set_option_string(mpv, "vulkan-swap-mode", "fifo"))
-        checkError(mpv_set_option_string(mpv, "vulkan-queue-count", "1"))
-        checkError(mpv_set_option_string(mpv, "vulkan-async-compute", "no"))
-        checkError(mpv_set_option_string(mpv, "vulkan-async-transfer", "no"))
-        checkError(mpv_set_option_string(mpv, "vulkan-disable-interop", "yes"))
         checkError(mpv_set_option_string(mpv, "video-rotate", "no"))
         checkError(mpv_set_option_string(mpv, "subs-match-os-language", "yes"))
         checkError(mpv_set_option_string(mpv, "subs-fallback", "yes"))
@@ -650,12 +734,21 @@ final class MPVPlayerViewController: UIViewController {
 
     @objc private func enterBackground() {
         guard mpv != nil else { return }
+        // While playing with PiP available, keep the video output alive so the
+        // system can move playback into the floating window automatically.
+        if isPlayerPlaying, pipController != nil {
+            return
+        }
         pausePlayback()
         setStringProperty("vid", "no")
     }
 
     @objc private func enterForeground() {
         guard mpv != nil else { return }
+        if let pip = pipController, pip.isPictureInPictureActive {
+            pipStopForForeground = true
+            pip.stopPictureInPicture()
+        }
         setStringProperty("vid", "auto")
         playPlayback()
     }
@@ -688,7 +781,7 @@ final class MPVPlayerViewController: UIViewController {
     private func attemptStartPendingLoad() {
         guard let request = pendingLoadRequest else { return }
         guard mpv != nil else { return }
-        layoutMetalLayer()
+        layoutVideoLayer()
         guard isViewportReadyForPlayback(queuedAtUptime: request.queuedAtUptime) else {
             schedulePendingLoadRetry()
             return
@@ -702,7 +795,7 @@ final class MPVPlayerViewController: UIViewController {
 
     private func startLoad(_ request: PendingLoadRequest) {
         guard mpv != nil else { return }
-        layoutMetalLayer()
+        layoutVideoLayer()
         clearPlaybackError()
         let sanitizedHeaders = sanitizeRequestHeaders(request.requestHeaders)
         activeRequestHeaders = sanitizedHeaders
@@ -787,6 +880,7 @@ final class MPVPlayerViewController: UIViewController {
         setFlag("pause", false)
         isPlayerPlaying = true
         syncNowPlayingPlaybackState(isPlaying: true)
+        pipController?.invalidatePlaybackState()
     }
 
     func pausePlayback() {
@@ -794,6 +888,7 @@ final class MPVPlayerViewController: UIViewController {
         setFlag("pause", true)
         isPlayerPlaying = false
         syncNowPlayingPlaybackState(isPlaying: false)
+        pipController?.invalidatePlaybackState()
     }
 
     func seekToMs(_ ms: Int64) {
@@ -842,7 +937,7 @@ final class MPVPlayerViewController: UIViewController {
         saturation: Int,
         gamma: Int
     ) {
-        metalLayer.wantsExtendedDynamicRangeContent = extendedDynamicRange
+        // Extended dynamic range is handled by AVFoundation for the avfoundation output.
         guard mpv != nil else { return }
 
         setStringProperty("hwdec", hardwareDecoder)
