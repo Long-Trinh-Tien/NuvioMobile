@@ -267,6 +267,8 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
     private var pipController: AVPictureInPictureController?
     private var isPipActive = false
     private var pipStopForForeground = false
+    private var lastKnownDurationSeconds: Double = 0
+    private var pipPossibleObservation: NSKeyValueObservation?
     private var externallyManagedViewSize: CGSize?
     private var pendingSurfaceLayoutWorkItems: [DispatchWorkItem] = []
     private var pendingLoadRequest: PendingLoadRequest?
@@ -398,6 +400,9 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
         let controller = AVPictureInPictureController(contentSource: source)
         controller.delegate = self
         controller.canStartPictureInPictureAutomaticallyFromInline = true
+        pipPossibleObservation = controller.observe(\.isPictureInPicturePossible, options: [.new]) { _, change in
+            print("[PiP] possible -> \(String(describing: change.newValue))")
+        }
         pipController = controller
         print("[PiP] ready (auto-start from inline enabled)")
     }
@@ -424,7 +429,7 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
         _ controller: AVPictureInPictureController,
         failedToStartPictureInPictureWithError error: Error
     ) {
-        print("[PiP] failed to start: \(error.localizedDescription)")
+        print("[PiP] failed to start: \(error)")
     }
 
     // MARK: - AVPictureInPictureSampleBufferPlaybackDelegate
@@ -462,10 +467,15 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
         _ controller: AVPictureInPictureController
     ) -> CMTimeRange {
         let durationSeconds = Double(durationMs) / 1000.0
-        if durationSeconds <= 0 {
-            return CMTimeRange(start: .negativeInfinity, duration: .positiveInfinity)
+        if durationSeconds > 0 {
+            lastKnownDurationSeconds = durationSeconds
         }
-        return CMTimeRange(start: .zero, duration: CMTime(seconds: durationSeconds, preferredTimescale: 600))
+        // Always expose a finite, seekable range so the PiP window consistently
+        // shows a scrubber and never the live/"direct" mode on this VOD player.
+        let useSeconds = durationSeconds > 0
+            ? durationSeconds
+            : (lastKnownDurationSeconds > 0 ? lastKnownDurationSeconds : 3600)
+        return CMTimeRange(start: .zero, duration: CMTime(seconds: useSeconds, preferredTimescale: 600))
     }
 
     override func viewWillAppear(_ animated: Bool) {
@@ -611,7 +621,12 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
         var layerPointer = Int64(Int(bitPattern: Unmanaged.passUnretained(videoLayer).toOpaque()))
         checkError(mpv_set_option(mpv, "wid", MPV_FORMAT_INT64, &layerPointer))
         checkError(mpv_set_option_string(mpv, "vo", "avfoundation"))
-        checkError(mpv_set_option_string(mpv, "avfoundation-composite-osd", "yes"))
+        // Keep the video path zero-copy: composite OSD runs a CoreImage pass over
+        // every frame while subtitles are visible and upscales to display
+        // resolution, which stutters badly in Picture in Picture (the GPU is
+        // throttled in the background). Subtitles render inline via the VO's
+        // OSD layer instead.
+        checkError(mpv_set_option_string(mpv, "avfoundation-composite-osd", "no"))
         checkError(mpv_set_option_string(mpv, "hwdec", "videotoolbox"))
         checkError(mpv_set_option_string(mpv, "ao", Self.defaultAudioOutput))
         checkError(mpv_set_option_string(mpv, "audio-channels", "auto"))
@@ -734,13 +749,25 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
 
     @objc private func enterBackground() {
         guard mpv != nil else { return }
-        // While playing with PiP available, keep the video output alive so the
-        // system can move playback into the floating window automatically.
-        if isPlayerPlaying, pipController != nil {
+        guard isPlayerPlaying, let pip = pipController else {
+            pausePlayback()
+            setStringProperty("vid", "no")
             return
         }
-        pausePlayback()
-        setStringProperty("vid", "no")
+
+        // While playing with PiP available, keep the video output alive so the
+        // system can move playback into the floating window (auto-start from
+        // inline). Nudge it once, then stop playback if PiP never came up so
+        // audio does not keep playing in the background without a video window.
+        print("[PiP] background: active=\(pip.isPictureInPictureActive) possible=\(pip.isPictureInPicturePossible)")
+        pip.startPictureInPicture()
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+            guard let self, !self.isPipActive else { return }
+            print("[PiP] did not start after backgrounding - pausing")
+            self.pausePlayback()
+            self.setStringProperty("vid", "no")
+        }
     }
 
     @objc private func enterForeground() {
