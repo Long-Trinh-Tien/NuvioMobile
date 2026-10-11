@@ -378,7 +378,6 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
 
         setupMpv()
         activateAudioSessionForPlayback()
-        setupNotifications()
         refreshImmersiveSystemUI()
     }
 
@@ -524,6 +523,10 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
 
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
+        addPlaybackObservers()
+        // The system may only auto-start PiP from a controller whose screen is
+        // actually visible; stale (pushed-back) player screens must stay out.
+        pipController?.canStartPictureInPictureAutomaticallyFromInline = true
         refreshImmersiveSystemUI()
     }
 
@@ -545,6 +548,8 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
     }
 
     override func viewWillDisappear(_ animated: Bool) {
+        removePlaybackObservers()
+        pipController?.canStartPictureInPictureAutomaticallyFromInline = false
         SystemUI.shared.playerDidBecomeHidden(self)
         super.viewWillDisappear(animated)
     }
@@ -784,15 +789,28 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
         zdLog("[MPV] demuxer-lavf-o node set -> \(err)")
     }
 
-    private func setupNotifications() {
-        NotificationCenter.default.addObserver(self, selector: #selector(enterBackground),
-                                               name: UIApplication.didEnterBackgroundNotification, object: nil)
-        NotificationCenter.default.addObserver(self, selector: #selector(enterForeground),
-                                               name: UIApplication.willEnterForegroundNotification, object: nil)
+    private func addPlaybackObservers() {
+        // Idempotent: re-registering on every appearance.
+        let center = NotificationCenter.default
+        center.removeObserver(self, name: UIApplication.didEnterBackgroundNotification, object: nil)
+        center.removeObserver(self, name: UIApplication.willEnterForegroundNotification, object: nil)
+        center.addObserver(self, selector: #selector(enterBackground),
+                           name: UIApplication.didEnterBackgroundNotification, object: nil)
+        center.addObserver(self, selector: #selector(enterForeground),
+                           name: UIApplication.willEnterForegroundNotification, object: nil)
+    }
+
+    private func removePlaybackObservers() {
+        let center = NotificationCenter.default
+        center.removeObserver(self, name: UIApplication.didEnterBackgroundNotification, object: nil)
+        center.removeObserver(self, name: UIApplication.willEnterForegroundNotification, object: nil)
     }
 
     @objc private func enterBackground() {
-        guard mpv != nil else { return }
+        // Stale player screens (kept in the navigation stack) must not react:
+        // their layer is off-screen and nudging their PiP controller fails with
+        // -1001 and fights the active player for the floating window.
+        guard mpv != nil, isViewLoaded, view.window != nil else { return }
         // Never disable the video track (vid=no) here: toggling it recreates the
         // whole video pipeline, breaks the VT decoder and leaves PiP black.
         guard isPlayerPlaying, let pip = pipController else {
@@ -804,30 +822,13 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
             return
         }
 
-        // While playing with PiP available, keep the video output alive so the
-        // system can move playback into the floating window (auto-start from
-        // inline). Nudge it once, then pause playback if PiP never came up so
-        // audio does not keep playing in the background without a video window.
         zdLog("[PiP] background: active=\(pip.isPictureInPictureActive) possible=\(pip.isPictureInPicturePossible)")
         logLayerState("background")
-        pip.startPictureInPicture()
-
-        pipFallbackWorkItem?.cancel()
-        let work = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            // Skip if the user already returned, or PiP did come up meanwhile.
-            guard UIApplication.shared.applicationState == .background else { return }
-            guard !self.isPipActive else { return }
-            zdLog("[PiP] did not start after backgrounding - pausing")
-            self.pausePlayback()
-            self.logLayerState("background-no-pip")
-        }
-        pipFallbackWorkItem = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: work)
+        schedulePipNudge("background")
     }
 
     @objc private func enterForeground() {
-        guard mpv != nil else { return }
+        guard mpv != nil, isViewLoaded, view.window != nil else { return }
         pipFallbackWorkItem?.cancel()
         pipFallbackWorkItem = nil
         var hadPip = false
@@ -983,21 +984,36 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
         isPlayerPlaying = true
         syncNowPlayingPlaybackState(isPlaying: true)
         pipController?.invalidatePlaybackState()
-        if UIApplication.shared.applicationState == .background,
-           let pip = pipController, !pip.isPictureInPictureActive {
-            // Playback started/restarted while in the background (e.g. a load
+        if UIApplication.shared.applicationState == .background {
+            // Playback started/restarted while backgrounded (e.g. a load
             // finished): make sure a PiP window comes up, or pause instead.
-            pipFallbackWorkItem?.cancel()
+            schedulePipNudge("play-in-background")
+        }
+    }
+
+    /// Give the system's automatic PiP a moment to come up, nudge it once if it
+    /// did not, then pause if there is still no floating window. Never touches
+    /// the video track (vid): toggling it recreates the whole video pipeline.
+    private func schedulePipNudge(_ reason: String) {
+        pipFallbackWorkItem?.cancel()
+        let nudge = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            guard UIApplication.shared.applicationState == .background else { return }
+            guard let pip = self.pipController, !pip.isPictureInPictureActive, !self.isPipActive else { return }
+            zdLog("[PiP] nudging start (\(reason))")
             pip.startPictureInPicture()
-            let work = DispatchWorkItem { [weak self] in
+            let pauseWork = DispatchWorkItem { [weak self] in
                 guard let self else { return }
                 guard UIApplication.shared.applicationState == .background, !self.isPipActive else { return }
-                zdLog("[PiP] background playback without PiP - pausing")
+                zdLog("[PiP] did not start after backgrounding - pausing")
                 self.pausePlayback()
+                self.logLayerState("background-no-pip")
             }
-            pipFallbackWorkItem = work
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: work)
+            self.pipFallbackWorkItem = pauseWork
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: pauseWork)
         }
+        pipFallbackWorkItem = nudge
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: nudge)
     }
 
     func pausePlayback() {
