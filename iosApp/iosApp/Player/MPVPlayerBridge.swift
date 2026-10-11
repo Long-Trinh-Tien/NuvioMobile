@@ -4,6 +4,11 @@ import AVFoundation
 import AVKit
 import Libmpv
 import ComposeApp
+import Darwin
+
+private func zdLog(_ message: String) {
+    NSLog("%@", message)
+}
 
 // MARK: - Player Bridge Implementation (Kotlin protocol conformance)
 
@@ -401,35 +406,73 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
         controller.delegate = self
         controller.canStartPictureInPictureAutomaticallyFromInline = true
         pipPossibleObservation = controller.observe(\.isPictureInPicturePossible, options: [.new]) { _, change in
-            print("[PiP] possible -> \(String(describing: change.newValue))")
+            zdLog("[PiP] possible -> \(String(describing: change.newValue))")
         }
         pipController = controller
-        print("[PiP] ready (auto-start from inline enabled)")
+        _ = Self.forceCompositeFn
+        zdLog("[PiP] ready (auto-start from inline enabled)")
+    }
+
+    // MARK: - PiP subtitle compositing + layer diagnostics
+
+    /// The engine (vo_avfoundation) exports this hook. While Picture in Picture
+    /// is active the OSD sublayer is not part of the PiP video pipeline, so we
+    /// ask the video output to composite subtitles into the sample buffers.
+    private static let forceCompositeFn: (@convention(c) (Int32) -> Void)? = {
+        guard let sym = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "nuvio_avfoundation_set_force_composite") else {
+            zdLog("[PiP] force-composite symbol NOT found")
+            return nil
+        }
+        zdLog("[PiP] force-composite symbol found")
+        return unsafeBitCast(sym, to: (@convention(c) (Int32) -> Void).self)
+    }()
+
+    private func setForceComposite(_ enabled: Bool) {
+        guard let fn = Self.forceCompositeFn else { return }
+        fn(enabled ? 1 : 0)
+        zdLog("[PiP] force-composite -> \(enabled)")
+    }
+
+    private func layerStatusName() -> String {
+        switch videoLayer.status {
+        case .rendering: return "rendering"
+        case .failed: return "failed"
+        default: return "unknown"
+        }
+    }
+
+    private func logLayerState(_ tag: String) {
+        zdLog("[Layer] \(tag) status=\(layerStatusName()) reqFlush=\(videoLayer.requiresFlushToResumeDecoding) err=\(videoLayer.error?.localizedDescription ?? "-") pip=\(pipController?.isPictureInPictureActive ?? false)/\(pipController?.isPictureInPicturePossible ?? false)")
     }
 
     // MARK: - AVPictureInPictureControllerDelegate
 
     func pictureInPictureControllerDidStartPictureInPicture(_ controller: AVPictureInPictureController) {
         isPipActive = true
-        print("[PiP] started")
+        setForceComposite(true)
+        logLayerState("pip-start")
+        zdLog("[PiP] started")
     }
 
     func pictureInPictureControllerDidStopPictureInPicture(_ controller: AVPictureInPictureController) {
         isPipActive = false
+        setForceComposite(false)
+        videoLayer.flush()
+        logLayerState("pip-stop")
         if pipStopForForeground {
             pipStopForForeground = false
         } else {
             // The user closed the floating window: stop playback.
             pausePlayback()
         }
-        print("[PiP] stopped")
+        zdLog("[PiP] stopped")
     }
 
     func pictureInPictureController(
         _ controller: AVPictureInPictureController,
         failedToStartPictureInPictureWithError error: Error
     ) {
-        print("[PiP] failed to start: \(error)")
+        zdLog("[PiP] failed to start: \(error)")
     }
 
     // MARK: - AVPictureInPictureSampleBufferPlaybackDelegate
@@ -612,7 +655,7 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
         installLavfWhitelistConfig()
         mpv = mpv_create()
         guard mpv != nil else {
-            print("[MPV] Failed to create mpv instance")
+            zdLog("[MPV] Failed to create mpv instance")
             return
         }
 
@@ -664,7 +707,7 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
             forResource: "NotoSansCJKsc-Regular",
             withExtension: "otf"
         ) else {
-            print("[MPV] Bundled CJK subtitle font is missing")
+            zdLog("[MPV] Bundled CJK subtitle font is missing")
             return
         }
 
@@ -673,7 +716,7 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
             checkError(mpv_set_option_string(mpv, "sub-fonts-dir", path))
         }
         checkError(mpv_set_option_string(mpv, "sub-font", "Noto Sans CJK SC"))
-        print("[MPV] Using bundled CJK subtitle font: \(fontURL.lastPathComponent)")
+        zdLog("[MPV] Using bundled CJK subtitle font: \(fontURL.lastPathComponent)")
     }
 
     // MARK: - HLS local-playlist nested-protocol whitelist (build 141)
@@ -737,7 +780,7 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
         }
 
         let err = mpv_set_option(mpv, "demuxer-lavf-o", MPV_FORMAT_NODE, &node)
-        print("[MPV] demuxer-lavf-o node set -> \(err)")
+        zdLog("[MPV] demuxer-lavf-o node set -> \(err)")
     }
 
     private func setupNotifications() {
@@ -750,6 +793,7 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
     @objc private func enterBackground() {
         guard mpv != nil else { return }
         guard isPlayerPlaying, let pip = pipController else {
+            zdLog("[PiP] background without playback -> pause + vid=no")
             pausePlayback()
             setStringProperty("vid", "no")
             return
@@ -759,14 +803,16 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
         // system can move playback into the floating window (auto-start from
         // inline). Nudge it once, then stop playback if PiP never came up so
         // audio does not keep playing in the background without a video window.
-        print("[PiP] background: active=\(pip.isPictureInPictureActive) possible=\(pip.isPictureInPicturePossible)")
+        zdLog("[PiP] background: active=\(pip.isPictureInPictureActive) possible=\(pip.isPictureInPicturePossible)")
+        logLayerState("background")
         pip.startPictureInPicture()
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
             guard let self, !self.isPipActive else { return }
-            print("[PiP] did not start after backgrounding - pausing")
+            zdLog("[PiP] did not start after backgrounding - pausing")
             self.pausePlayback()
             self.setStringProperty("vid", "no")
+            self.logLayerState("background-no-pip")
         }
     }
 
@@ -776,8 +822,10 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
             pipStopForForeground = true
             pip.stopPictureInPicture()
         }
+        videoLayer.flush()
         setStringProperty("vid", "auto")
         playPlayback()
+        logLayerState("foreground")
     }
 
     // MARK: - Playback API
@@ -821,6 +869,11 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
     }
 
     private func startLoad(_ request: PendingLoadRequest) {
+        if mpv == nil {
+            // The backend may have been torn down while the view controller
+            // survived (episode switches): bring it up again.
+            setupMpv()
+        }
         guard mpv != nil else { return }
         layoutVideoLayer()
         clearPlaybackError()
@@ -831,6 +884,11 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
         isPlayerEnded = false
         applyAudioLanguagePreferences(preferredAudioLanguages)
         resetDiscontinuityGuard()
+        // Fresh video-output state for the new file: re-enable the video track
+        // and drop any queued frames from the previous episode.
+        setStringProperty("vid", "auto")
+        videoLayer.flush()
+        logLayerState("pre-load")
         // Sanitize sloppy ad-spliced HLS playlists (e.g. KKPhim/phimapi) so mpv
         // keeps playing across discontinuities instead of resetting to 0.
         // Falls back to the original URL on any failure.
@@ -852,7 +910,7 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
                 self.timelineHoles = HLSPlaylistSanitizer.lastHoles.map {
                     TimelineHole(start: $0.start, size: $0.size)
                 }
-                print("[MPV] timeline holes: \(self.timelineHoles.count)")
+                zdLog("[MPV] timeline holes: \(self.timelineHoles.count)")
                 self.command(
                     "change-list",
                     args: [
@@ -1240,7 +1298,7 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
         discontinuityRescuesUsed += 1
         discontinuityRescueCooldownUntil = now + 5
         let rescueMs = lastGoodPositionMs
-        print("[MPV] Discontinuity reset detected (\(previousPollPositionMs) -> \(positionMs)), rescuing to \(rescueMs) (attempt \(discontinuityRescuesUsed))")
+        zdLog("[MPV] Discontinuity reset detected (\(previousPollPositionMs) -> \(positionMs)), rescuing to \(rescueMs) (attempt \(discontinuityRescuesUsed))")
         if Thread.isMainThread {
             seekToMs(rescueMs)
         } else {
@@ -1303,10 +1361,10 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
             timelineHoles[index].start = previousRawPosition
             timelineHoles[index].size = delta
             timelineHoles[index].observed = true
-            print("[MPV] timeline hole \(index) observed at \(previousRawPosition) size \(delta)")
+            zdLog("[MPV] timeline hole \(index) observed at \(previousRawPosition) size \(delta)")
         } else {
             timelineHoles.append(TimelineHole(start: previousRawPosition, size: delta, observed: true))
-            print("[MPV] timeline hole (unknown) observed at \(previousRawPosition) size \(delta)")
+            zdLog("[MPV] timeline hole (unknown) observed at \(previousRawPosition) size \(delta)")
         }
     }
 
@@ -1553,6 +1611,9 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
                         self.updateState()
                         self.publishNowPlayingForPlaybackSession()
                         self.logCurrentAudioOutput()
+                        self.logLayerState("file-loaded")
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in self?.logLayerState("file-loaded+3s") }
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 8.0) { [weak self] in self?.logLayerState("file-loaded+8s") }
                     }
                 case MPV_EVENT_PLAYBACK_RESTART:
                     DispatchQueue.main.async {
@@ -1565,7 +1626,7 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
                         if endFile.reason == MPV_END_FILE_REASON_ERROR {
                             let errorText = String(cString: mpv_error_string(endFile.error))
                             self.setPlaybackError("[mpv] \(errorText)")
-                            print("[MPV] End file error: \(errorText)")
+                            zdLog("[MPV] End file error: \(errorText)")
                         }
                     }
                 case MPV_EVENT_SHUTDOWN:
@@ -1576,7 +1637,7 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
                         let level = String(cString: msg.pointee.level!)
                         let text = String(cString: msg.pointee.text!)
                         self.appendPlaybackLog(prefix: prefix, level: level, text: text)
-                        print("[MPV][\(prefix)] \(level): \(text)", terminator: "")
+                        zdLog("[MPV][\(prefix)] \(level): \(text)")
                     }
                 default:
                     break
@@ -1657,13 +1718,13 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
                 ?? "unknown"
             let channelCount = self.getInt("audio-out-params/channel-count")
             let codec = self.getString("audio-codec-name") ?? "unknown"
-            print("[MPV] Audio output: ao=\(currentAo), channels=\(channels), channelCount=\(channelCount), codec=\(codec)")
+            zdLog("[MPV] Audio output: ao=\(currentAo), channels=\(channels), channelCount=\(channelCount), codec=\(codec)")
         }
     }
 
     private func checkError(_ status: CInt) {
         if status < 0 {
-            print("[MPV] API error: \(String(cString: mpv_error_string(status)))")
+            zdLog("[MPV] API error: \(String(cString: mpv_error_string(status)))")
         }
     }
 
