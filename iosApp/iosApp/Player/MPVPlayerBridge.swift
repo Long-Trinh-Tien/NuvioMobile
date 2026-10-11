@@ -272,6 +272,7 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
     private var pipController: AVPictureInPictureController?
     private var isPipActive = false
     private var pipStopForForeground = false
+    private var pipFallbackWorkItem: DispatchWorkItem?
     private var lastKnownDurationSeconds: Double = 0
     private var pipPossibleObservation: NSKeyValueObservation?
     private var externallyManagedViewSize: CGSize?
@@ -792,39 +793,55 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
 
     @objc private func enterBackground() {
         guard mpv != nil else { return }
+        // Never disable the video track (vid=no) here: toggling it recreates the
+        // whole video pipeline, breaks the VT decoder and leaves PiP black.
         guard isPlayerPlaying, let pip = pipController else {
-            zdLog("[PiP] background without playback -> pause + vid=no")
-            pausePlayback()
-            setStringProperty("vid", "no")
+            zdLog("[PiP] background while idle -> state left as-is")
+            return
+        }
+        if pip.isPictureInPictureActive {
+            zdLog("[PiP] background: PiP already active")
             return
         }
 
         // While playing with PiP available, keep the video output alive so the
         // system can move playback into the floating window (auto-start from
-        // inline). Nudge it once, then stop playback if PiP never came up so
+        // inline). Nudge it once, then pause playback if PiP never came up so
         // audio does not keep playing in the background without a video window.
         zdLog("[PiP] background: active=\(pip.isPictureInPictureActive) possible=\(pip.isPictureInPicturePossible)")
         logLayerState("background")
         pip.startPictureInPicture()
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-            guard let self, !self.isPipActive else { return }
+        pipFallbackWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            // Skip if the user already returned, or PiP did come up meanwhile.
+            guard UIApplication.shared.applicationState == .background else { return }
+            guard !self.isPipActive else { return }
             zdLog("[PiP] did not start after backgrounding - pausing")
             self.pausePlayback()
-            self.setStringProperty("vid", "no")
             self.logLayerState("background-no-pip")
         }
+        pipFallbackWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: work)
     }
 
     @objc private func enterForeground() {
         guard mpv != nil else { return }
+        pipFallbackWorkItem?.cancel()
+        pipFallbackWorkItem = nil
+        var hadPip = false
         if let pip = pipController, pip.isPictureInPictureActive {
+            hadPip = true
             pipStopForForeground = true
             pip.stopPictureInPicture()
         }
         videoLayer.flush()
-        setStringProperty("vid", "auto")
-        playPlayback()
+        if hadPip {
+            // Resume inline only when returning from an active PiP session;
+            // otherwise keep whatever pause state the user had.
+            playPlayback()
+        }
         logLayerState("foreground")
     }
 
@@ -966,6 +983,21 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
         isPlayerPlaying = true
         syncNowPlayingPlaybackState(isPlaying: true)
         pipController?.invalidatePlaybackState()
+        if UIApplication.shared.applicationState == .background,
+           let pip = pipController, !pip.isPictureInPictureActive {
+            // Playback started/restarted while in the background (e.g. a load
+            // finished): make sure a PiP window comes up, or pause instead.
+            pipFallbackWorkItem?.cancel()
+            pip.startPictureInPicture()
+            let work = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                guard UIApplication.shared.applicationState == .background, !self.isPipActive else { return }
+                zdLog("[PiP] background playback without PiP - pausing")
+                self.pausePlayback()
+            }
+            pipFallbackWorkItem = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: work)
+        }
     }
 
     func pausePlayback() {
@@ -979,6 +1011,7 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
     func seekToMs(_ ms: Int64) {
         guard mpv != nil else { return }
         let rawSeconds = rawPosition(fromUI: Double(ms) / 1000.0)
+        zdLog("[MPV] seekToMs ui=\(ms)ms raw=\(String(format: "%.3f", rawSeconds))s")
         muteHoleDetection(for: 3)
         command("seek", args: [String(format: "%.3f", rawSeconds), "absolute"])
     }
@@ -988,6 +1021,7 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
         let rawNow = max(getDouble("time-pos"), 0)
         let targetUI = uiPosition(fromRaw: rawNow) + Double(ms) / 1000.0
         let rawTarget = rawPosition(fromUI: max(targetUI, 0))
+        zdLog("[MPV] seekByMs off=\(ms)ms raw=\(String(format: "%.3f", rawTarget))s (mode=\(exact ? "exact" : "normal"))")
         muteHoleDetection(for: 3)
         let seekMode = exact ? "absolute+exact" : "absolute"
         command("seek", args: [String(format: "%.3f", rawTarget), seekMode])
