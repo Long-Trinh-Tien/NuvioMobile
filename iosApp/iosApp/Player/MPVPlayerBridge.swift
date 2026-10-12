@@ -273,6 +273,7 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
     private var isPipActive = false
     private var pipStopForForeground = false
     private var pipFallbackWorkItem: DispatchWorkItem?
+    private var pipBackgroundTask: UIBackgroundTaskIdentifier = .invalid
     private var lastKnownDurationSeconds: Double = 0
     private var pipPossibleObservation: NSKeyValueObservation?
     private var externallyManagedViewSize: CGSize?
@@ -449,6 +450,7 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
 
     func pictureInPictureControllerDidStartPictureInPicture(_ controller: AVPictureInPictureController) {
         isPipActive = true
+        endPipBackgroundTask()
         setForceComposite(true)
         logLayerState("pip-start")
         zdLog("[PiP] started")
@@ -824,6 +826,7 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
 
         zdLog("[PiP] background: active=\(pip.isPictureInPictureActive) possible=\(pip.isPictureInPicturePossible)")
         logLayerState("background")
+        beginPipBackgroundTask()
         schedulePipNudge("background")
     }
 
@@ -831,6 +834,7 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
         guard mpv != nil, isViewLoaded, view.window != nil else { return }
         pipFallbackWorkItem?.cancel()
         pipFallbackWorkItem = nil
+        endPipBackgroundTask()
         var hadPip = false
         if let pip = pipController, pip.isPictureInPictureActive {
             hadPip = true
@@ -1007,6 +1011,7 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
                 guard UIApplication.shared.applicationState == .background, !self.isPipActive else { return }
                 zdLog("[PiP] did not start after backgrounding - pausing")
                 self.pausePlayback()
+                self.endPipBackgroundTask()
                 self.logLayerState("background-no-pip")
             }
             self.pipFallbackWorkItem = pauseWork
@@ -1014,6 +1019,29 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
         }
         pipFallbackWorkItem = nudge
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: nudge)
+    }
+
+    /// Keep the process running briefly while the app transitions to the
+    /// background so iOS does not invalidate the VideoToolbox decode session
+    /// before PiP takes over (invalid sessions force a software-decode fallback).
+    private func beginPipBackgroundTask() {
+        guard pipBackgroundTask == .invalid else { return }
+        pipBackgroundTask = UIApplication.shared.beginBackgroundTask(withName: "pip-transition") { [weak self] in
+            guard let self else { return }
+            zdLog("[PiP] background task expired")
+            self.endPipBackgroundTask()
+        }
+        zdLog("[PiP] background task started")
+        // Safety: never hold the task for more than ~12s.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 12.0) { [weak self] in
+            self?.endPipBackgroundTask()
+        }
+    }
+
+    private func endPipBackgroundTask() {
+        guard pipBackgroundTask != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(pipBackgroundTask)
+        pipBackgroundTask = .invalid
     }
 
     func pausePlayback() {
