@@ -995,30 +995,25 @@ final class MPVPlayerViewController: UIViewController, AVPictureInPictureControl
         }
     }
 
-    /// Give the system's automatic PiP a moment to come up, nudge it once if it
-    /// did not, then pause if there is still no floating window. Never touches
-    /// the video track (vid): toggling it recreates the whole video pipeline.
+    /// The system starts PiP itself (canStartPictureInPictureAutomaticallyFromInline).
+    /// Manual startPictureInPicture() nudges raced with that start and failed
+    /// with -1001, sometimes cancelling the system's own attempt (PiP then only
+    /// came up on a second try). Keep only the safety net: pause if no PiP
+    /// window came up, so audio never keeps playing in the background without a
+    /// video view. Never touches the video track (vid): toggling it recreates
+    /// the whole video pipeline.
     private func schedulePipNudge(_ reason: String) {
         pipFallbackWorkItem?.cancel()
-        let nudge = DispatchWorkItem { [weak self] in
+        let pauseWork = DispatchWorkItem { [weak self] in
             guard let self else { return }
-            guard UIApplication.shared.applicationState == .background else { return }
-            guard let pip = self.pipController, !pip.isPictureInPictureActive, !self.isPipActive else { return }
-            zdLog("[PiP] nudging start (\(reason))")
-            pip.startPictureInPicture()
-            let pauseWork = DispatchWorkItem { [weak self] in
-                guard let self else { return }
-                guard UIApplication.shared.applicationState == .background, !self.isPipActive else { return }
-                zdLog("[PiP] did not start after backgrounding - pausing")
-                self.pausePlayback()
-                self.endPipBackgroundTask()
-                self.logLayerState("background-no-pip")
-            }
-            self.pipFallbackWorkItem = pauseWork
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: pauseWork)
+            guard UIApplication.shared.applicationState == .background, !self.isPipActive else { return }
+            zdLog("[PiP] no PiP after backgrounding (\(reason)) - pausing")
+            self.pausePlayback()
+            self.endPipBackgroundTask()
+            self.logLayerState("background-no-pip")
         }
-        pipFallbackWorkItem = nudge
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: nudge)
+        pipFallbackWorkItem = pauseWork
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.5, execute: pauseWork)
     }
 
     /// Keep the process running briefly while the app transitions to the
